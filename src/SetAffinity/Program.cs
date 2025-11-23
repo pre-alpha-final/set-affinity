@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace SetAffinity;
 
@@ -6,29 +7,12 @@ internal class Program
 {
     static async Task Main(string[] args)
     {
-        var programStartTime = DateTime.Now;
-        while (true)
-        {
-            var processes = Process.GetProcesses();
-            _ = Task.Run(async () =>
+        IHostBuilder builder = Host.CreateDefaultBuilder(args)
+            .UseWindowsService() // 👈 enables Windows Service mode
+            .ConfigureServices((hostContext, services) =>
             {
-                await Task.Delay(20000);
-                foreach (var process in processes)
-                {
-                    try
-                    {
-                        if (process.StartTime > programStartTime)
-                        {
-                            process.ProcessorAffinity = (nint)4294966527;
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        // ignore
-                    }
-                }
+                services.AddHostedService<App>(); // your background service
             });
-            await Task.Delay(5000);
-        }
+        builder.Build().Run();
     }
 }
