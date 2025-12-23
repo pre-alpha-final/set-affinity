@@ -5,6 +5,14 @@ namespace SetAffinity;
 
 internal class App : BackgroundService
 {
+    private readonly IList<string> _clearedProcesses =
+    [
+        "svchost.exe",
+        "NvBroadcast.Container.exe",
+        "nvcontainer.exe",
+        "NVDisplay.Container.exe",
+    ];
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var programStartTime = DateTime.Now;
@@ -18,9 +26,12 @@ internal class App : BackgroundService
                 {
                     try
                     {
-                        if (process.StartTime > programStartTime)
+                        using (process)
                         {
-                            process.ProcessorAffinity = (nint)4294966527;
+                            if (process.StartTime > programStartTime || _clearedProcesses.Contains(process.MainModule?.ModuleName ?? string.Empty))
+                            {
+                                process.ProcessorAffinity = (nint)4294966527;
+                            }
                         }
                     }
                     catch (Exception e)
