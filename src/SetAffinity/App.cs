@@ -12,6 +12,12 @@ internal class App : BackgroundService
         "nvcontainer.exe",
         "NVDisplay.Container.exe",
     ];
+    private readonly string[] _args;
+
+    public App(string[] args)
+    {
+        _args = args;
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -28,7 +34,7 @@ internal class App : BackgroundService
                     {
                         using (process)
                         {
-                            if (process.StartTime > programStartTime || _clearedProcesses.Contains(process.MainModule?.ModuleName ?? string.Empty))
+                            if (_args[0] == "all" || process.StartTime > programStartTime || _clearedProcesses.Contains(process.MainModule?.ModuleName ?? string.Empty))
                             {
                                 process.ProcessorAffinity = (nint)4294966527;
                             }
