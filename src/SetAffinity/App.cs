@@ -5,13 +5,6 @@ namespace SetAffinity;
 
 internal class App : BackgroundService
 {
-    private readonly IList<string> _clearedProcesses =
-    [
-        "svchost.exe",
-        "NvBroadcast.Container.exe",
-        "nvcontainer.exe",
-        "NVDisplay.Container.exe",
-    ];
     private readonly string[] _args;
 
     public App(string[] args)
@@ -34,7 +27,7 @@ internal class App : BackgroundService
                     {
                         using (process)
                         {
-                            if (_args[0] == "all" || process.StartTime > programStartTime || _clearedProcesses.Contains(process.MainModule?.ModuleName ?? string.Empty))
+                            if ((_args.Length > 0 && _args[0] == "all") || process.StartTime > programStartTime)
                             {
                                 process.ProcessorAffinity = (nint)4294966527;
                             }
