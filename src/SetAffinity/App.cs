@@ -12,6 +12,7 @@ internal class App : BackgroundService
         "explorer.exe",
         "svchost.exe -k netsvcs -p -s Schedule",
         "taskhostw.exe",
+        "svchost.exe -k DcomLaunch -p",
         //"winlogon.exe",
         //"userinit.exe",
         //"wininit.exe",
