@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.Hosting;
+using System.CommandLine;
 using System.Diagnostics;
 using System.Management;
 
@@ -6,24 +7,19 @@ namespace SetAffinity;
 
 internal class App : BackgroundService
 {
-    private readonly string[] _args;
     private readonly List<string> _appLaunchersBlacklist =
     [
         "explorer.exe",
         "svchost.exe -k netsvcs -p -s Schedule",
         "taskhostw.exe",
         "svchost.exe -k DcomLaunch -p",
-        //"winlogon.exe",
-        //"userinit.exe",
-        //"wininit.exe",
-        //"services.exe",
-        //"lsass.exe",
-        //"taskmgr.exe",
     ];
+    private string _mode;
+    private nint _cpuMask;
 
     public App(string[] args)
     {
-        _args = args;
+        HandleArgs(args);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -47,9 +43,9 @@ internal class App : BackgroundService
                                 continue;
                             }
 
-                            if ((_args.Length > 0 && _args[0] == "all") || process.StartTime > programStartTime)
+                            if ((_mode == "a") || process.StartTime > programStartTime)
                             {
-                                process.ProcessorAffinity = (nint)4294966527;
+                                process.ProcessorAffinity = _cpuMask;
                             }
                         }
                     }
@@ -60,7 +56,38 @@ internal class App : BackgroundService
                 }
             });
             await Task.Delay(5000);
+
+            if (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
         }
+    }
+
+    private void HandleArgs(string[] args)
+    {
+        var mode = new Option<string>("mode", "-m", "--mode")
+        {
+            Description = "'a' for all (default), 'n' for newly appearing apps only (compatibility mode)"
+        };
+        var cpuMask = new Argument<string>("cpu mask")
+        {
+            Description = "binary mask for logical CPUs"
+        };
+        var rootCommand = new RootCommand("Set cpu affinity for apps")
+        {
+            mode,
+            cpuMask,
+        };
+        var parseResult = rootCommand.Parse(args);
+        parseResult.Invoke();
+        if (parseResult.Errors.Count > 0)
+        {
+            throw new ArgumentException("Invalid arguments");
+        }
+
+        _mode = parseResult.GetValue(mode) ?? "a";
+        _cpuMask = (nint)Convert.ToInt64(new string(parseResult.GetValue(cpuMask)!.Reverse().ToArray()), 2);
     }
 
     private static string? GetCommandLine(Process process)
