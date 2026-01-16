@@ -55,7 +55,7 @@ internal class App : BackgroundService
                     }
                 }
             });
-            await Task.Delay(5000);
+            await Task.Delay(5000, stoppingToken);
 
             if (stoppingToken.IsCancellationRequested)
             {
