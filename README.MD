@@ -4,10 +4,6 @@ Runs as a Windows service that automatically forces CPU affinity on most process
 # Because Intel
 https://www.google.com/search?q=intel+processor+oxidation%2Fcorrosion
 
-# Ok, Intel CPU, fine, but where exactly?
-Turns out you can actually check which core is the faulty one:  
-https://www.youtube.com/watch?v=dU5qLJqTSAc&t=1099s
-
 # Download
 [Latest Release](../../releases/latest)
 
