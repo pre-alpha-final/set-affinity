@@ -14,7 +14,9 @@ internal class App : BackgroundService
         "taskhostw.exe",
         "svchost.exe -k DcomLaunch -p",
         "winlogon.exe",
+        "steam.exe",
     ];
+    private readonly List<string> _appLaunchersBlacklistIdentifiers = new();
     private string _mode;
     private nint _cpuMask;
 
@@ -29,13 +31,14 @@ internal class App : BackgroundService
         while (true)
         {
             var processes = Process.GetProcesses();
-            await Task.Delay(5000, stoppingToken);
-            await Task.Delay(5000, stoppingToken);
-            await Task.Delay(5000, stoppingToken);
-            await Task.Delay(5000, stoppingToken);
-            await HandleProcesses(processes, programStartTime, stoppingToken);
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(5000, stoppingToken);
+                await Task.Delay(5000, stoppingToken);
+                await Task.Delay(5000, stoppingToken);
+                await HandleProcesses(processes, programStartTime, stoppingToken);
+            });
 
-            await Task.Delay(5000, stoppingToken);
             await Task.Delay(5000, stoppingToken);
             if (stoppingToken.IsCancellationRequested)
             {
@@ -57,7 +60,7 @@ internal class App : BackgroundService
             {
                 using (process)
                 {
-                    if (process.ProcessorAffinity == _cpuMask)
+                    if (process.ProcessorAffinity == _cpuMask || _appLaunchersBlacklistIdentifiers.Contains($"{process.Id}{process.StartTime.Ticks}"))
                     {
                         continue;
                     }
@@ -65,6 +68,7 @@ internal class App : BackgroundService
                     var commandLine = GetCommandLine(process);
                     if (commandLine != null && _appLaunchersBlacklist.Any(e => commandLine.Contains(e, StringComparison.OrdinalIgnoreCase)))
                     {
+                        _appLaunchersBlacklistIdentifiers.Add($"{process.Id}{process.StartTime.Ticks}");
                         continue;
                     }
 
