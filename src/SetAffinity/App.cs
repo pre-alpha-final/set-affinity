@@ -16,7 +16,11 @@ internal class App : BackgroundService
         "winlogon.exe",
         "steam.exe",
     ];
-    private readonly List<string> _appLaunchersBlacklistIdentifiers = new();
+    private readonly HashSet<string> _appLaunchersBlacklistIdentifiers = new();
+    private readonly List<string> _extendedDelay =
+    [
+        "deathloop.exe",
+    ];
     private string _mode;
     private nint _cpuMask;
 
@@ -33,8 +37,6 @@ internal class App : BackgroundService
             var processes = Process.GetProcesses();
             _ = Task.Run(async () =>
             {
-                await Task.Delay(5000, stoppingToken);
-                await Task.Delay(5000, stoppingToken);
                 await Task.Delay(5000, stoppingToken);
                 await HandleProcesses(processes, programStartTime, stoppingToken);
             });
@@ -60,7 +62,12 @@ internal class App : BackgroundService
             {
                 using (process)
                 {
-                    if (process.ProcessorAffinity == _cpuMask || _appLaunchersBlacklistIdentifiers.Contains($"{process.Id}{process.StartTime.Ticks}"))
+                    if (process.ProcessorAffinity == _cpuMask)
+                    {
+                        continue;
+                    }
+
+                    if (_appLaunchersBlacklistIdentifiers.Contains($"{process.Id}{process.StartTime.Ticks}"))
                     {
                         continue;
                     }
@@ -74,7 +81,23 @@ internal class App : BackgroundService
 
                     if ((_mode == "a") || process.StartTime > programStartTime)
                     {
-                        process.ProcessorAffinity = _cpuMask;
+                        if (commandLine != null && _extendedDelay.Any(e => commandLine.Contains(e, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            var pid = process.Id;
+                            _ = Task.Run(async () =>
+                            {
+                                using (var processFromPid = Process.GetProcessById(pid))
+                                {
+                                    await Task.Delay(5000, stoppingToken);
+                                    await Task.Delay(5000, stoppingToken);
+                                    processFromPid.ProcessorAffinity = _cpuMask;
+                                }
+                            });
+                        }
+                        else
+                        {
+                            process.ProcessorAffinity = _cpuMask;
+                        }
                     }
                 }
             }
