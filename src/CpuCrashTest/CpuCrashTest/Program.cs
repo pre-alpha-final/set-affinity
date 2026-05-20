@@ -16,6 +16,7 @@ static void RunLauncher()
         ? envCount
         : Environment.ProcessorCount;
 
+    Console.OutputEncoding = System.Text.Encoding.UTF8;
     Console.WriteLine("╔══════════════════════════════════╗");
     Console.WriteLine("║       CPU CRASH TEST LAUNCHER    ║");
     Console.WriteLine("╚══════════════════════════════════╝");
@@ -25,6 +26,29 @@ static void RunLauncher()
     Console.WriteLine();
 
     string exePath = Process.GetCurrentProcess().MainModule!.FileName;
+    var workers = new List<Process>(coreCount);
+
+    void KillAll()
+    {
+        foreach (var w in workers)
+        {
+            try { if (!w.HasExited) w.Kill(); }
+            catch { /* already gone */ }
+        }
+    }
+
+    // Covers Ctrl+C: cancel the default termination so we can clean up first.
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        Console.WriteLine();
+        Console.WriteLine("Stopping — killing all worker windows...");
+        KillAll();
+        Environment.Exit(0);
+    };
+
+    // Covers closing this window via the X button (CTRL_CLOSE_EVENT gives ~5 s).
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => KillAll();
 
     for (int i = 0; i < coreCount; i++)
     {
@@ -35,18 +59,26 @@ static void RunLauncher()
             UseShellExecute = true,
             CreateNoWindow = false,
         };
-        Process.Start(psi);
+        var proc = Process.Start(psi);
+        if (proc is not null) workers.Add(proc);
         Console.WriteLine($"  Launched worker for core {i}");
     }
 
     Console.WriteLine();
-    Console.WriteLine($"All {coreCount} worker(s) launched. Press any key to exit the launcher.");
+    Console.WriteLine($"All {coreCount} worker(s) launched.");
+    Console.WriteLine("NOTE: closing this window will also close all worker windows.");
+    Console.WriteLine("Press any key to stop all workers and exit.");
     Console.ReadKey(intercept: true);
+
+    Console.WriteLine();
+    Console.WriteLine("Stopping — killing all worker windows...");
+    KillAll();
 }
 
 static void RunWorker(int coreIndex)
 {
     using var cts = new CancellationTokenSource();
+
     Console.CancelKeyPress += (_, e) =>
     {
         e.Cancel = true;
