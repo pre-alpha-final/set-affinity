@@ -60,7 +60,13 @@ static void RunLauncher()
             CreateNoWindow = false,
         };
         var proc = Process.Start(psi);
-        if (proc is not null) workers.Add(proc);
+        if (proc is not null)
+        {
+            workers.Add(proc);
+            int core = i;
+            proc.EnableRaisingEvents = true;
+            proc.Exited += (_, _) => Console.WriteLine($"  [!] Worker for core {core} has closed.");
+        }
         Console.WriteLine($"  Launched worker for core {i}");
     }
 
