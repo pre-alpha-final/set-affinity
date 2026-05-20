@@ -24,19 +24,23 @@ else
 
 static StressMode ParseMode(string? s) => s?.ToLowerInvariant() switch
 {
-    "fma"         => StressMode.Fma,
-    "int"         => StressMode.Int,
-    "branch"      => StressMode.Branch,
-    "call"        => StressMode.Call,
-    "threads"     => StressMode.Threads,
-    "mixed"       => StressMode.Mixed,
-    "divide"      => StressMode.Divide,
+    "fma"          => StressMode.Fma,
+    "int"          => StressMode.Int,
+    "branch"       => StressMode.Branch,
+    "call"         => StressMode.Call,
+    "threads"      => StressMode.Threads,
+    "mixed"        => StressMode.Mixed,
+    "divide"       => StressMode.Divide,
     "pointerchase" => StressMode.PointerChase,
-    "ptrchase"    => StressMode.PointerChase,
-    "dispatch"    => StressMode.Dispatch,
-    "bursty"      => StressMode.Bursty,
-    "verify"      => StressMode.Verify,
-    _             => StressMode.Rotate,
+    "ptrchase"     => StressMode.PointerChase,
+    "dispatch"     => StressMode.Dispatch,
+    "bursty"       => StressMode.Bursty,
+    "verify"       => StressMode.Verify,
+    "hermes"       => StressMode.Hermes,
+    "atomic"       => StressMode.Atomic,
+    "memcpy"       => StressMode.Memcpy,
+    "bmi"          => StressMode.Bmi,
+    _              => StressMode.Rotate,
 };
 
 static string ModeLabel(StressMode m) => m switch
@@ -54,6 +58,10 @@ static string ModeLabel(StressMode m) => m switch
     StressMode.Dispatch     => "DISPATCH",
     StressMode.Bursty       => "BURSTY",
     StressMode.Verify       => "VERIFY",
+    StressMode.Hermes       => "HERMES",
+    StressMode.Atomic       => "ATOMIC",
+    StressMode.Memcpy       => "MEMCPY",
+    StressMode.Bmi          => "BMI",
     _                       => "ROTATE",
 };
 
@@ -186,7 +194,8 @@ static void StressDispatcher(int coreIndex, StressMode mode, CancellationToken c
     // silent ALU corruption on a faulty core into an observable AV (0xC0000005), matching the
     // hermes.dll / Unity crash signature.  Integer-heavy modes follow.  FMA last.
     StressMode[] rotation = [
-        StressMode.PointerChase, StressMode.Dispatch, StressMode.Bursty, StressMode.Verify,
+        StressMode.Hermes, StressMode.Atomic, StressMode.PointerChase, StressMode.Dispatch,
+        StressMode.Bmi, StressMode.Memcpy, StressMode.Bursty, StressMode.Verify,
         StressMode.Int, StressMode.Branch, StressMode.Call, StressMode.Mixed,
         StressMode.Divide, StressMode.Threads, StressMode.Fma,
     ];
@@ -216,6 +225,10 @@ static void RunMode(int coreIndex, StressMode mode, CancellationToken ct)
         case StressMode.Dispatch:     StressLoopDispatch(coreIndex, ct);     break;
         case StressMode.Bursty:       StressLoopBursty(coreIndex, ct);       break;
         case StressMode.Verify:       StressLoopVerify(coreIndex, ct);       break;
+        case StressMode.Hermes:       StressLoopHermes(coreIndex, ct);       break;
+        case StressMode.Atomic:       StressLoopAtomic(coreIndex, ct);       break;
+        case StressMode.Memcpy:       StressLoopMemcpy(coreIndex, ct);       break;
+        case StressMode.Bmi:          StressLoopBmi(coreIndex, ct);          break;
         default:                      StressLoopFma(coreIndex, ct);          break;
     }
 }
@@ -850,6 +863,273 @@ static void StressLoopVerify(int coreIndex, CancellationToken ct)
     }
 }
 
+// ── mode: HERMES ───────────────────────────────────────────────────────────
+
+// Direct simulation of the hermes.dll interpreter inner loop.  Combines the four
+// instruction patterns Hermes hammers per opcode dispatch, in the exact order Hermes
+// emits them, on a single dependency chain:
+//
+//   1. LOAD     — load a 64-bit NaN-boxed value from the JS value stack (`mov rax,[rcx]`).
+//   2. MOVQ↔    — bitcast the value GPR→XMM and back (`vmovq xmm,rax; vmovq rax,xmm`).
+//                 Hermes does this on every value-as-double test.  XMM↔GPR bypass is the
+//                 dominant pattern not exercised by any prior mode (Mixed uses CVTSI2SD,
+//                 which is conversion — different uops, different ports).
+//   3. AND      — mask off the NaN-box tag (`and rax, PTR_MASK`).  This is where Hermes
+//                 extracts the 48-bit pointer.  A glitch here produces a noncanonical
+//                 address — and on x86, dereferencing a noncanonical address is #GP, which
+//                 surfaces as AV (0xC0000005) just like in real Hermes crashes.
+//   4. CALL[r]  — indirect call through the opcode-handler table (`call qword ptr [rdx+rax*8]`).
+//   5. LOAD     — chase the extracted pointer (`mov rcx,[rax]`).
+//
+// All five happen on one dependency chain in a tight unrolled loop, so the core is forced
+// to issue them back-to-back — no ILP relief and no port slack.
+static unsafe void StressLoopHermes(int coreIndex, CancellationToken ct)
+{
+    const int N = 1 << 18;                                  // 256 K slots × 8 B = 2 MiB (fits in L2)
+    byte* region = (byte*)NativeMemory.AlignedAlloc((nuint)N * 8, 64);
+
+    // Reuse the same 8 handlers as Dispatch; here we tile only the low 4 indices.
+    const int HandlerCount = 4;
+    var handlers = (delegate*<long, long>*)NativeMemory.Alloc((nuint)HandlerCount * (nuint)sizeof(nint));
+    handlers[0] = &H_Add;
+    handlers[1] = &H_Xor;
+    handlers[2] = &H_Mul;
+    handlers[3] = &H_Mix;
+
+    try
+    {
+        long* slots = (long*)region;
+
+        var rng = new Random(unchecked(0x0ABBA + coreIndex * 7919));
+        int[] perm = new int[N];
+        for (int i = 0; i < N; i++) perm[i] = i;
+        for (int i = N - 1; i > 0; i--)
+        {
+            int j = rng.Next(i);
+            (perm[i], perm[j]) = (perm[j], perm[i]);
+        }
+
+        // QNAN_TAG mimics the Hermes encoding: bits 49-63 set ⇒ "this is a tagged box".
+        // PTR_MASK gives the 48-bit user-space pointer payload.
+        const long QNAN_TAG = unchecked((long)0xFFFE_0000_0000_0000UL);
+        const long PTR_MASK =          0x0000_FFFF_FFFF_FFFFL;
+
+        // Each slot is the next slot's address NaN-boxed as a Hermes pointer.
+        for (int i = 0; i < N; i++)
+            slots[i] = (long)(region + (long)perm[i] * 8L) | QNAN_TAG;
+
+        long state = (long)slots;                           // current slot pointer
+        long acc   = 0;
+        var sw = Stopwatch.StartNew();
+        long iterations = 0;
+        double[] buf = new double[512 * 1024];
+
+        while (!ct.IsCancellationRequested)
+        {
+            // 4× unrolled.  Each unrolled body is one full Hermes interpreter step shape.
+            for (int u = 0; u < 4; u++)
+            {
+                long raw = *(long*)state;                           // LOAD: tagged value
+
+                // MOVQ bounce: bits cross GPR→XMM→GPR.  This is the Hermes NaN test path
+                // (load value into XMM, test if it's a finite double).  Round-trip is
+                // bit-preserving by IEEE-754, so `bits == raw` on healthy silicon.
+                double dv = BitConverter.Int64BitsToDouble(raw);
+                long bits = BitConverter.DoubleToInt64Bits(dv);
+
+                // Extract the 48-bit pointer payload by AND-masking the NaN tag.
+                // A glitch in the AND on bits 12-47 produces a wild pointer → next *(long*)state faults.
+                long ptr = bits & PTR_MASK;
+
+                // Indirect dispatch on a few low bits — Hermes opcode jump-table.
+                // The selector also depends on `bits`, so the indirect target is data-dependent.
+                acc = handlers[(int)(bits & (HandlerCount - 1))](acc ^ ptr);
+
+                state = ptr;                                        // CHASE
+            }
+            iterations++;
+
+            if ((iterations & 0xFF) == 0)
+            {
+                buf[(int)((iterations >> 8) & (buf.Length - 1))] += (double)(acc & 0x7FFFFFFFL);
+
+                if (iterations % 5_000_000 == 0)
+                    Console.Write($"\r[Core {coreIndex}] HERMES — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {iterations * 4 / 1_000_000}M ops");
+            }
+        }
+    }
+    finally
+    {
+        NativeMemory.Free(handlers);
+        NativeMemory.AlignedFree(region);
+    }
+}
+
+// ── mode: ATOMIC ───────────────────────────────────────────────────────────
+
+// LOCK-prefixed atomic operations.  Every Hermes GC safepoint and every Unity Mono
+// reference-count bump emits `LOCK CMPXCHG` / `LOCK XADD` / `XCHG` — a uniquely
+// microcoded path that bridges the load/store unit with the cache-coherence protocol.
+// LOCK atomics historically expose the most subtle Errata in degraded x86 silicon
+// because their uop sequence touches the entire memory subsystem in a single retire.
+static unsafe void StressLoopAtomic(int coreIndex, CancellationToken ct)
+{
+    // 8 longs, one per 64-byte cache line — uncontended within a single worker,
+    // but each Interlocked op still asserts LOCK on the bus / coherence fabric.
+    const int LineCount = 8;
+    long* counters = (long*)NativeMemory.AlignedAlloc((nuint)(LineCount * 64), 64);
+    for (int i = 0; i < LineCount; i++) counters[i * 8] = 0;
+
+    try
+    {
+        var sw = Stopwatch.StartNew();
+        long iterations = 0;
+        double[] buf = new double[512 * 1024];
+
+        while (!ct.IsCancellationRequested)
+        {
+            // 8 LOCK-prefixed ops per iteration spread across 8 distinct cache lines.
+            // Mix of XADD (Increment, Add), XCHG (Exchange), and CMPXCHG (CompareExchange)
+            // to exercise every variant of the atomic microcode sequencer.
+            long v0 = Interlocked.Increment(ref *(counters + 0 * 8));
+            long v1 = Interlocked.Add(ref *(counters + 1 * 8), 7);
+            long v2 = Interlocked.Exchange(ref *(counters + 2 * 8), v0);
+            long v3 = Interlocked.CompareExchange(ref *(counters + 3 * 8), v1, v2);
+            long v4 = Interlocked.Increment(ref *(counters + 4 * 8));
+            long v5 = Interlocked.Add(ref *(counters + 5 * 8), 11);
+            long v6 = Interlocked.Exchange(ref *(counters + 6 * 8), v4);
+            long v7 = Interlocked.CompareExchange(ref *(counters + 7 * 8), v5, v6);
+
+            iterations++;
+            if ((iterations & 0xFF) == 0)
+            {
+                buf[(int)((iterations >> 8) & (buf.Length - 1))] += (double)((v7 ^ v3) & 0x7FFFFFFFL);
+
+                if (iterations % 5_000_000 == 0)
+                    Console.Write($"\r[Core {coreIndex}] ATOMIC — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {iterations * 8 / 1_000_000}M atomics");
+            }
+        }
+    }
+    finally
+    {
+        NativeMemory.AlignedFree(counters);
+    }
+}
+
+// ── mode: MEMCPY ───────────────────────────────────────────────────────────
+
+// REP MOVSB / SIMD-vector / scalar memcpy paths.  Buffer.MemoryCopy dispatches on size:
+// small copies inline as scalar+SIMD; medium copies emit AVX vector loops; large copies
+// (with ERMSB) emit pure `REP MOVSB`.  All three paths share the load/store unit but
+// stress the microcode sequencer (`REP MOVSB`), the AVX vector pipes, and the unaligned
+// load fast-path differently.  Hermes string ops and Unity managed-array copies are the
+// dominant emitters of these paths in real applications.
+static unsafe void StressLoopMemcpy(int coreIndex, CancellationToken ct)
+{
+    const int BufSize = 64 * 1024;                          // L1d-resident — pure copy bandwidth, no L2 stall
+    byte* src = (byte*)NativeMemory.AlignedAlloc(BufSize, 64);
+    byte* dst = (byte*)NativeMemory.AlignedAlloc(BufSize, 64);
+
+    for (int i = 0; i < BufSize; i++)
+    {
+        src[i] = (byte)(i ^ coreIndex);
+        dst[i] = 0;
+    }
+
+    // Sizes chosen to hit every internal copy path:
+    //   7-63    : scalar/SSE tail
+    //   97-257  : AVX vector loop
+    //   511-4093: AVX + REP MOVSB tail
+    //   8191+   : pure REP MOVSB (ERMSB) on modern x86.
+    int[] sizes   = [ 7, 13, 23, 31, 47, 63, 97, 127, 193, 257, 511, 1023, 2047, 4093, 8191, 16383 ];
+    int[] offsets = [ 0, 1, 2, 3, 5, 7, 11, 13 ];           // unaligned src/dst — split-line stress
+
+    try
+    {
+        var sw = Stopwatch.StartNew();
+        long iterations = 0;
+        int sizeIdx = 0, offIdx = 0;
+
+        while (!ct.IsCancellationRequested)
+        {
+            // 256 copies per progress check — keep the load/store unit saturated.
+            for (int batch = 0; batch < 256; batch++)
+            {
+                int sz = sizes[sizeIdx & 15];
+                int oS = offsets[offIdx & 7];
+                int oD = offsets[(offIdx + 3) & 7];
+                Buffer.MemoryCopy(src + oS, dst + oD, BufSize - oD, sz);
+                Buffer.MemoryCopy(dst + oD, src + oS, BufSize - oS, sz);
+                sizeIdx++; offIdx++;
+            }
+            iterations++;
+
+            if (iterations % 100_000 == 0)
+                Console.Write($"\r[Core {coreIndex}] MEMCPY — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {iterations / 1_000}K batches");
+        }
+    }
+    finally
+    {
+        NativeMemory.AlignedFree(src);
+        NativeMemory.AlignedFree(dst);
+    }
+}
+
+// ── mode: BMI ──────────────────────────────────────────────────────────────
+
+// BMI1 / BMI2 / LZCNT instructions exercise a distinct execution unit (the "bit
+// manipulation port", typically port 1 on Intel) with microcode entirely separate from
+// regular ALU ops.  PDEP/PEXT in particular are notoriously slow microcoded sequences
+// on older silicon and known to fail timing on degraded Raptor Lake cores.  Falls back
+// to INT mode if the CPU lacks BMI support (pre-Haswell).
+static void StressLoopBmi(int coreIndex, CancellationToken ct)
+{
+    if (!Bmi1.X64.IsSupported || !Bmi2.X64.IsSupported || !Lzcnt.X64.IsSupported)
+    {
+        Console.WriteLine($"[Core {coreIndex}] BMI1/BMI2/LZCNT not supported — falling back to INT.");
+        StressLoopInt(coreIndex, ct);
+        return;
+    }
+
+    var sw = Stopwatch.StartNew();
+    long iterations = 0;
+    double[] buf = new double[512 * 1024];
+
+    ulong x0 = 0x123456789ABCDEF0UL, x1 = 0x23456789ABCDEF01UL;
+    ulong x2 = 0x3456789ABCDEF012UL, x3 = 0x456789ABCDEF0123UL;
+    ulong x4 = 0x56789ABCDEF01234UL, x5 = 0x6789ABCDEF012345UL;
+    ulong x6 = 0x789ABCDEF0123456UL, x7 = 0x89ABCDEF01234567UL;
+
+    const ulong MASK = 0xDEAD_BEEF_CAFE_BABEUL;
+
+    while (!ct.IsCancellationRequested)
+    {
+        // 8 chains, each hitting a different BMI/LZCNT instruction every iteration.
+        x0 = Bmi2.X64.ParallelBitDeposit(x0, MASK);                     // PDEP   — microcoded scatter
+        x1 = Bmi2.X64.ParallelBitExtract(x1, MASK);                     // PEXT   — microcoded gather
+        x2 = Bmi1.X64.AndNot(x2, MASK);                                 // ANDN   — single uop
+        x3 = Bmi1.X64.TrailingZeroCount(x3 | 1UL);                      // TZCNT
+        x4 = Bmi1.X64.ExtractLowestSetBit(x4 | 1UL);                    // BLSI
+        x5 = Bmi2.X64.MultiplyNoFlags(x5, 6364136223846793005UL);       // MULX   — multiply, no flags
+        x6 = BitOperations.RotateRight(x6, 17);                          // RORX   (JIT-emitted under BMI2)
+        x7 = Lzcnt.X64.LeadingZeroCount(x7 | 1UL);                      // LZCNT
+
+        // Cross-pollinate to keep the chains data-dependent and prevent the JIT from
+        // schedulling them all in parallel on the same port cycle.
+        x0 ^= x1; x1 ^= x2; x2 ^= x3; x3 ^= x4;
+        x4 ^= x5; x5 ^= x6; x6 ^= x7; x7 ^= x0;
+
+        iterations++;
+        if ((iterations & 0xFF) == 0)
+        {
+            buf[(int)((iterations >> 8) & (buf.Length - 1))] += (double)(x0 & 0x7FFFFFFFUL);
+
+            if (iterations % 50_000_000 == 0)
+                Console.Write($"\r[Core {coreIndex}] BMI — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {iterations / 1_000_000}M iterations");
+        }
+    }
+}
+
 // ── mode: FMA (original, unchanged) ───────────────────────────────────────
 
 // Dispatches to the widest SIMD FMA path the CPU supports at runtime.
@@ -1020,4 +1300,4 @@ static void StressLoopVector(int coreIndex, CancellationToken ct)
 
 // ── types ──────────────────────────────────────────────────────────────────
 
-enum StressMode { Fma, Int, Branch, Call, Threads, Mixed, Divide, PointerChase, Dispatch, Bursty, Verify, Rotate }
+enum StressMode { Fma, Int, Branch, Call, Threads, Mixed, Divide, PointerChase, Dispatch, Bursty, Verify, Hermes, Atomic, Memcpy, Bmi, Rotate }

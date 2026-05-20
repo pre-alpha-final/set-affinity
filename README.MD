@@ -36,10 +36,14 @@ Run with `--mode <name>` (default is `rotate`, which cycles through every mode f
 
 | Mode            | What it stresses                                                                                          |
 |-----------------|-----------------------------------------------------------------------------------------------------------|
-| `pointerchase`  | NaN-box-style ALU chain feeding an immediate load — silent bit-flip becomes `0xC0000005`. **Best bet** for reproducing `hermes.dll` / Unity crashes. |
+| `hermes`        | Direct simulation of the `hermes.dll` interpreter step: LOAD → MOVQ XMM↔GPR bounce → AND mask → indirect dispatch → pointer chase. **First thing to try** for `hermes.dll` crashes. |
+| `atomic`        | `LOCK`-prefixed atomics — `CMPXCHG` / `XADD` / `XCHG` via `Interlocked` across 8 cache lines.  Microcoded path used by Hermes GC safepoints and Unity Mono refcounting. |
+| `pointerchase`  | NaN-box-style ALU chain feeding an immediate load — silent bit-flip becomes `0xC0000005`.                |
 | `dispatch`      | Indirect-call hot loop through a 256-entry function-pointer table — same shape as Hermes opcode dispatch and Unity vtable calls. |
+| `bmi`           | BMI1 / BMI2 / LZCNT chains — PDEP, PEXT, ANDN, TZCNT, BLSI, MULX, RORX, LZCNT.  Distinct bit-manipulation port + microcoded scatter/gather. |
+| `memcpy`        | `Buffer.MemoryCopy` with mixed unaligned offsets and sizes spanning all three internal paths (scalar / AVX vector / `REP MOVSB`). |
 | `bursty`        | ~10 ms full-bore INT+FP burst, then `Sleep(2)` — hammers the Vmin/P-state transition that steady-state stressors miss. |
-| `verify`        | Four shadow LCG chains computed in parallel; logs silent miscalculations *without* crashing. Useful when the faulty core corrupts results without producing an AV. |
+| `verify`        | Four shadow LCG chains computed in parallel; logs silent miscalculations *without* crashing.  Useful when the faulty core corrupts results without producing an AV. |
 | `int`           | 8× 64-bit LCG + rotate-XOR — IA-core integer multiplier and rotate units.                                |
 | `branch`        | 16-arm `switch` on unpredictable input — front-end, BTB, ROB recovery.                                   |
 | `call`          | Recursion to depth 48 — overflows the Return Stack Buffer.                                               |
