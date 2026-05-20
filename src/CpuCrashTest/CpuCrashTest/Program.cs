@@ -40,6 +40,9 @@ static StressMode ParseMode(string? s) => s?.ToLowerInvariant() switch
     "atomic"       => StressMode.Atomic,
     "memcpy"       => StressMode.Memcpy,
     "bmi"          => StressMode.Bmi,
+    "idxchase"     => StressMode.IdxChase,
+    "idx"          => StressMode.IdxChase,
+    "idxcall"      => StressMode.IdxCall,
     _              => StressMode.Rotate,
 };
 
@@ -62,6 +65,8 @@ static string ModeLabel(StressMode m) => m switch
     StressMode.Atomic       => "ATOMIC",
     StressMode.Memcpy       => "MEMCPY",
     StressMode.Bmi          => "BMI",
+    StressMode.IdxChase     => "IDX-CHASE",
+    StressMode.IdxCall      => "IDX-CALL",
     _                       => "ROTATE",
 };
 
@@ -194,10 +199,10 @@ static void StressDispatcher(int coreIndex, StressMode mode, CancellationToken c
     // silent ALU corruption on a faulty core into an observable AV (0xC0000005), matching the
     // hermes.dll / Unity crash signature.  Integer-heavy modes follow.  FMA last.
     StressMode[] rotation = [
-        StressMode.Hermes, StressMode.Atomic, StressMode.PointerChase, StressMode.Dispatch,
-        StressMode.Bmi, StressMode.Memcpy, StressMode.Bursty, StressMode.Verify,
-        StressMode.Int, StressMode.Branch, StressMode.Call, StressMode.Mixed,
-        StressMode.Divide, StressMode.Threads, StressMode.Fma,
+        StressMode.IdxCall, StressMode.IdxChase, StressMode.Hermes, StressMode.Atomic,
+        StressMode.PointerChase, StressMode.Dispatch, StressMode.Bmi, StressMode.Memcpy,
+        StressMode.Bursty, StressMode.Verify, StressMode.Int, StressMode.Branch,
+        StressMode.Call, StressMode.Mixed, StressMode.Divide, StressMode.Threads, StressMode.Fma,
     ];
     int idx = 0;
     while (!ct.IsCancellationRequested)
@@ -229,6 +234,8 @@ static void RunMode(int coreIndex, StressMode mode, CancellationToken ct)
         case StressMode.Atomic:       StressLoopAtomic(coreIndex, ct);       break;
         case StressMode.Memcpy:       StressLoopMemcpy(coreIndex, ct);       break;
         case StressMode.Bmi:          StressLoopBmi(coreIndex, ct);          break;
+        case StressMode.IdxChase:     StressLoopIdxChase(coreIndex, ct);     break;
+        case StressMode.IdxCall:      StressLoopIdxCall(coreIndex, ct);      break;
         default:                      StressLoopFma(coreIndex, ct);          break;
     }
 }
@@ -1130,6 +1137,199 @@ static void StressLoopBmi(int coreIndex, CancellationToken ct)
     }
 }
 
+// ── mode: IDX-CHASE ────────────────────────────────────────────────────────
+
+// Direct replica of the actual hermes.dll faulting instruction observed in real-world
+// crashes on this faulty CPU:
+//
+//     mov  ecx, dword ptr [rdx + rcx*4 + 8]      ; 8B 4C 8A 08
+//
+// Three things distinguish this from every other mode and from real Hermes code:
+//
+//   1. 32-bit indexed load at SIB scale 4 — `MOV r32, [base + r32*4 + disp]`.
+//      The C# JIT emits exactly this opcode for `uint result = uintPtr[idx]`.
+//   2. Tiny 4 KiB table backed by VirtualAlloc with reservation rounded to 64 KiB
+//      granularity.  The page after the table is reserved-but-uncommitted — a single
+//      read past `[0, 1024)` faults immediately with AV (0xC0000005), the exact
+//      Hermes crash shape.
+//   3. No intermediate ALU between chases — pure load→index chain.  If the load
+//      itself glitches OR the AGU's `base + idx*4 + disp` computation glitches OR
+//      the previous chase's destination zero-extension corrupts the upper 32 bits
+//      of RCX, the next iteration's instruction faults instantly.
+//
+// On a healthy core the Sattolo cycle keeps `idx` in [0, 1024) forever; on a faulty
+// core, any single-bit corruption in bits 10-31 of the index → AV.
+static unsafe void StressLoopIdxChase(int coreIndex, CancellationToken ct)
+{
+    const int  N             = 1024;                        // 1024 × 4 B = 4 KiB = 1 page
+    const uint MEM_COMMIT    = 0x1000;
+    const uint MEM_RESERVE   = 0x2000;
+    const uint MEM_RELEASE   = 0x8000;
+    const uint PAGE_READWRITE = 0x04;
+
+    // VirtualAlloc reserves 64 KiB (granularity) and commits only 4 KiB.  The
+    // remaining 60 KiB is reserved-but-uncommitted ⇒ reading it faults.  This is
+    // what makes a small index corruption into a guaranteed AV.
+    uint* table = (uint*)VirtualAlloc(null, (nuint)N * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (table == null)
+        throw new InvalidOperationException($"VirtualAlloc failed: Win32 error {Marshal.GetLastWin32Error()}");
+
+    try
+    {
+        // Sattolo shuffle — produces a single cycle of length N through the table.
+        // Each cell stores the index of the next cell in the cycle.
+        var rng = new Random(unchecked(0x0CAFE + coreIndex * 7919));
+        int[] perm = new int[N];
+        for (int i = 0; i < N; i++) perm[i] = i;
+        for (int i = N - 1; i > 0; i--)
+        {
+            int j = rng.Next(i);
+            (perm[i], perm[j]) = (perm[j], perm[i]);
+        }
+        for (int i = 0; i < N; i++) table[i] = (uint)perm[i];
+
+        uint idx = 0;
+        var sw = Stopwatch.StartNew();
+        long iterations = 0;
+        double[] buf = new double[512 * 1024];
+
+        while (!ct.IsCancellationRequested)
+        {
+            // 8× unrolled.  Each statement compiles to the exact 4-byte opcode
+            //     8B 0C 8A    mov ecx, dword ptr [rdx + rcx*4]
+            // (matching the hermes.dll fault — minus the +8 disp, which doesn't matter
+            // because the SIB calculation pipeline is identical).
+            idx = table[idx];
+            idx = table[idx];
+            idx = table[idx];
+            idx = table[idx];
+            idx = table[idx];
+            idx = table[idx];
+            idx = table[idx];
+            idx = table[idx];
+            iterations++;
+
+            if ((iterations & 0xFF) == 0)
+            {
+                buf[(int)((iterations >> 8) & (buf.Length - 1))] += (double)idx;
+
+                if (iterations % 5_000_000 == 0)
+                    Console.Write($"\r[Core {coreIndex}] IDX-CHASE — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {iterations * 8 / 1_000_000}M chases");
+            }
+        }
+    }
+    finally
+    {
+        VirtualFree(table, 0, MEM_RELEASE);
+    }
+}
+
+// VirtualAlloc gives us a region whose adjacent (reserved-but-uncommitted) pages
+// fault on any read — essential for catching small-magnitude index corruption.
+// NativeMemory.AlignedAlloc backs onto the C heap, whose adjacent pages may be
+// mapped (and thus would silently absorb the corruption instead of crashing).
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern unsafe void* VirtualAlloc(void* lpAddress, nuint dwSize, uint flAllocationType, uint flProtect);
+
+[DllImport("kernel32.dll", SetLastError = true)]
+[return: MarshalAs(UnmanagedType.Bool)]
+static extern unsafe bool VirtualFree(void* lpAddress, nuint dwSize, uint dwFreeType);
+
+// ── mode: IDX-CALL ─────────────────────────────────────────────────────────
+
+// Combines the IDX-CHASE pattern with deep CALL/RET recursion — the precise shape
+// observed in the real hermes.dll crash dump's call stack.  The dump showed:
+//
+//   * Crash at `mov ecx, [rdx + rcx*4 + 8]` — scale-4 indexed load (covered by IdxChase).
+//   * ~200 nested frames of the same handler recursing into itself — Hermes interprets
+//     bytecode via genuine C++ function recursion, not threaded dispatch, so every JS
+//     call/return is a real CALL/RET pair on the native stack.
+//   * The recursion repeatedly hit a small ring of return addresses (~ 6 distinct sites),
+//     and each frame did an indexed load *both before* recursing into the child and
+//     *after* the child returned.
+//
+// This mode replicates that exact shape: depth-128 NoInlining recursion, each level doing
+// one scale-4 indexed load on the way down and one on the way back up.  The recursion
+// depth (128) comfortably exceeds the Raptor Lake RSB (16-24 entries), so every RET on
+// the way up is a mispredict that must be recovered via the indirect predictor — the
+// front-end is under sustained pressure for the entire chain, simultaneously with the
+// load/store unit doing the scale-4 chases.
+static unsafe void StressLoopIdxCall(int coreIndex, CancellationToken ct)
+{
+    const int  N             = 1024;                        // 1024 × 4 B = 4 KiB = 1 page
+    const uint MEM_COMMIT    = 0x1000;
+    const uint MEM_RESERVE   = 0x2000;
+    const uint MEM_RELEASE   = 0x8000;
+    const uint PAGE_READWRITE = 0x04;
+
+    uint* table = (uint*)VirtualAlloc(null, (nuint)N * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (table == null)
+        throw new InvalidOperationException($"VirtualAlloc failed: Win32 error {Marshal.GetLastWin32Error()}");
+
+    try
+    {
+        var rng = new Random(unchecked(0x0DEAD + coreIndex * 7919));
+        int[] perm = new int[N];
+        for (int i = 0; i < N; i++) perm[i] = i;
+        for (int i = N - 1; i > 0; i--)
+        {
+            int j = rng.Next(i);
+            (perm[i], perm[j]) = (perm[j], perm[i]);
+        }
+        for (int i = 0; i < N; i++) table[i] = (uint)perm[i];
+
+        // 128 frames ≫ RSB depth (16-24).  Real Hermes recursion at crash time was ~200
+        // deep, but our C# frames are smaller; 128 is enough to fully exhaust the RSB and
+        // saturate the indirect-target predictor on the way back up.
+        const int CallDepth = 128;
+
+        var sw = Stopwatch.StartNew();
+        long iterations = 0;
+        double[] buf = new double[512 * 1024];
+        uint idx = 0;
+
+        while (!ct.IsCancellationRequested)
+        {
+            idx = RecurseIdxCall(table, idx, CallDepth);
+            iterations++;
+
+            if ((iterations & 0xFF) == 0)
+            {
+                buf[(int)((iterations >> 8) & (buf.Length - 1))] += (double)idx;
+
+                if (iterations % 1_000_000 == 0)
+                    Console.Write($"\r[Core {coreIndex}] IDX-CALL — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {iterations * CallDepth * 2 / 1_000_000}M loads ({iterations / 1_000_000}M depth-{CallDepth} recursions)");
+            }
+        }
+    }
+    finally
+    {
+        VirtualFree(table, 0, MEM_RELEASE);
+    }
+}
+
+// NoInlining forces real CALL/RET pairs at every level (the JIT cannot collapse the
+// chain into a loop).  The post-call `table[inner]` ensures the recursive call is not
+// in tail position, blocking tail-call optimisation and keeping the full return chain
+// intact — every frame must perform a CALL on the way down and a RET on the way up.
+[MethodImpl(MethodImplOptions.NoInlining)]
+static unsafe uint RecurseIdxCall(uint* table, uint idx, int depth)
+{
+    // CALL-down side: scale-4 indexed load.  C# JIT emits `mov ecx, [rax + rcx*4]`,
+    // matching the hermes.dll faulting instruction's pattern exactly.
+    idx = table[idx];
+
+    if (depth == 0)
+        return idx;
+
+    uint inner = RecurseIdxCall(table, idx, depth - 1);
+
+    // RET-up side: second scale-4 indexed load whose index comes from the child's
+    // return value (in EAX after the RET).  If anything between this frame's CALL and
+    // its child's matching RET corrupts the propagated value, this load AVs immediately.
+    return table[inner];
+}
+
 // ── mode: FMA (original, unchanged) ───────────────────────────────────────
 
 // Dispatches to the widest SIMD FMA path the CPU supports at runtime.
@@ -1300,4 +1500,4 @@ static void StressLoopVector(int coreIndex, CancellationToken ct)
 
 // ── types ──────────────────────────────────────────────────────────────────
 
-enum StressMode { Fma, Int, Branch, Call, Threads, Mixed, Divide, PointerChase, Dispatch, Bursty, Verify, Hermes, Atomic, Memcpy, Bmi, Rotate }
+enum StressMode { Fma, Int, Branch, Call, Threads, Mixed, Divide, PointerChase, Dispatch, Bursty, Verify, Hermes, Atomic, Memcpy, Bmi, IdxChase, IdxCall, Rotate }
