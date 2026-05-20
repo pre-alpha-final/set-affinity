@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
@@ -25,9 +26,11 @@ static StressMode ParseMode(string? s) => s?.ToLowerInvariant() switch
     "fma"    => StressMode.Fma,
     "int"    => StressMode.Int,
     "branch" => StressMode.Branch,
-    "mixed"  => StressMode.Mixed,
-    "divide" => StressMode.Divide,
-    _        => StressMode.Rotate,
+    "call"    => StressMode.Call,
+    "threads" => StressMode.Threads,
+    "mixed"   => StressMode.Mixed,
+    "divide"  => StressMode.Divide,
+    _         => StressMode.Rotate,
 };
 
 static string ModeLabel(StressMode m) => m switch
@@ -37,7 +40,9 @@ static string ModeLabel(StressMode m) => m switch
                        : "SIMD",
     StressMode.Int    => "INT",
     StressMode.Branch => "BRANCH",
-    StressMode.Mixed  => "MIXED",
+    StressMode.Call    => "CALL/RET",
+    StressMode.Threads => "THREADS",
+    StressMode.Mixed   => "MIXED",
     StressMode.Divide => "DIVIDE",
     _                 => "ROTATE",
 };
@@ -168,7 +173,7 @@ static void StressDispatcher(int coreIndex, StressMode mode, CancellationToken c
     }
 
     // Integer-heavy modes come first — most likely to expose IA-core clock-tree damage.
-    StressMode[] rotation = [StressMode.Int, StressMode.Branch, StressMode.Mixed, StressMode.Divide, StressMode.Fma];
+    StressMode[] rotation = [StressMode.Int, StressMode.Branch, StressMode.Call, StressMode.Mixed, StressMode.Divide, StressMode.Threads, StressMode.Fma];
     int idx = 0;
     while (!ct.IsCancellationRequested)
     {
@@ -187,7 +192,9 @@ static void RunMode(int coreIndex, StressMode mode, CancellationToken ct)
     {
         case StressMode.Int:    StressLoopInt(coreIndex, ct);    break;
         case StressMode.Branch: StressLoopBranch(coreIndex, ct); break;
-        case StressMode.Mixed:  StressLoopMixed(coreIndex, ct);  break;
+        case StressMode.Call:    StressLoopCall(coreIndex, ct);    break;
+        case StressMode.Threads: StressLoopThreads(coreIndex, ct); break;
+        case StressMode.Mixed:   StressLoopMixed(coreIndex, ct);   break;
         case StressMode.Divide: StressLoopDivide(coreIndex, ct); break;
         default:                StressLoopFma(coreIndex, ct);    break;
     }
@@ -432,6 +439,132 @@ static void StressLoopDivide(int coreIndex, CancellationToken ct)
     }
 }
 
+// ── mode: CALL/RET ────────────────────────────────────────────────────────
+
+// Hammers CALL and RET instructions by recursing to a depth that exceeds the RSB
+// (Return Stack Buffer, typically 16–24 entries on Raptor Lake P-cores).  Once the RSB
+// is exhausted, every RET must speculate the return address via the indirect predictor —
+// mis-speculations flush the pipeline and exercise the front-end recovery path.
+// This models the function-call-heavy patterns in Hermes (JS interpreter frames) and
+// Unity Mono (managed-to-native call stubs, GC barriers).
+static void StressLoopCall(int coreIndex, CancellationToken ct)
+{
+    double[] buf = new double[512 * 1024];
+    var  sw = Stopwatch.StartNew();
+    long iterations = 0;
+    long acc = 0x123456789ABCDEFL;
+
+    // 48 levels: comfortably exceeds the RSB depth on all Raptor Lake variants,
+    // ensuring a mix of correct RSB hits (shallow frames) and mis-speculating RETs
+    // (deep frames beyond RSB capacity).
+    const int CallDepth = 48;
+
+    while (!ct.IsCancellationRequested)
+    {
+        acc = Recurse(acc, CallDepth);
+        iterations++;
+
+        if ((iterations & 0xFF) == 0)
+        {
+            buf[(int)((iterations >> 8) & (buf.Length - 1))] += (double)acc;
+
+            if (iterations % 5_000_000 == 0)
+                Console.Write($"\r[Core {coreIndex}] CALL/RET — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {iterations / 1_000_000}M iterations");
+        }
+    }
+}
+
+// NoInlining forces a real CALL/RET pair at every level (the JIT cannot collapse the
+// chain into a loop).  The post-call XOR ensures the frame is not in tail position,
+// blocking tail-call optimisation and keeping the full return chain intact.
+[MethodImpl(MethodImplOptions.NoInlining)]
+static long Recurse(long v, int depth)
+{
+    if (depth == 0)
+        return unchecked(v * 6364136223846793005L + 1442695040888963407L);
+    long child = Recurse(unchecked(v * 6364136223846793005L + 1442695040888963407L), depth - 1);
+    return unchecked(child ^ (v >> 3));
+}
+
+// ── mode: THREADS ─────────────────────────────────────────────────────────
+
+// Runs 4 threads on the same core (3 companions + the calling thread).  Each thread
+// does a burst of integer+FP work to fill registers with live state, then calls
+// Thread.Yield() to hand the core to one of its siblings.  The kernel must then execute
+// XSAVE (saves GP, SSE, and AVX register state) and XRSTOR (restores the next thread's
+// state) on every switch — multi-cycle microcode sequences absent in every other mode.
+// Also triggers SYSCALL/SYSRET and the RSB flush applied on ring-3→0 transitions.
+static void StressLoopThreads(int coreIndex, CancellationToken ct)
+{
+    double[] buf = new double[512 * 1024];
+    var  sw = Stopwatch.StartNew();
+    long yields = 0;
+
+    // Companion threads inherit the process's single-core affinity automatically,
+    // so all 4 threads compete for the same logical CPU and switch rapidly.
+    const int CompanionCount = 3;
+    var companions = new Thread[CompanionCount];
+
+    for (int t = 0; t < CompanionCount; t++)
+    {
+        int tid = t;
+        companions[t] = new Thread(() =>
+        {
+            ulong x = unchecked((ulong)(tid + 2) * 0x9E3779B97F4A7C15UL);
+            const ulong CA = 6364136223846793005UL;
+            const ulong CB = 1442695040888963407UL;
+
+            while (!ct.IsCancellationRequested)
+            {
+                // Fill GPRs with live data before the switch so XSAVE has state worth saving.
+                for (int i = 0; i < 32; i++)
+                {
+                    x = unchecked(x * CA + CB);
+                    x ^= BitOperations.RotateLeft(x, 17);
+                }
+                // Dirty XMM/YMM state so XSAVE also captures the full FP/AVX context.
+                double d = (double)x * 1e-10;
+                d = d * 1.0000001 + 0.0000001;
+                if (d > 1e15) x ^= (ulong)d;
+
+                Thread.Yield();
+            }
+        }) { IsBackground = true };
+        companions[t].Start();
+    }
+
+    ulong acc = 0x123456789ABCDEF0UL;
+    const ulong A = 6364136223846793005UL;
+    const ulong B = 1442695040888963407UL;
+    double fd = 1.0;
+
+    while (!ct.IsCancellationRequested)
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            acc = unchecked(acc * A + B);
+            acc ^= BitOperations.RotateLeft(acc, 17);
+        }
+        fd = (double)acc * 1e-10;
+        fd = fd * 1.0000001 + 0.0000001;
+        if (fd > 1e15) acc ^= (ulong)fd;
+
+        Thread.Yield();
+        yields++;
+
+        if ((yields & 0xFF) == 0)
+        {
+            buf[(int)((yields >> 8) & (buf.Length - 1))] += fd;
+
+            if (yields % 100_000 == 0)
+                Console.Write($"\r[Core {coreIndex}] THREADS — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {yields / 1_000}K yields");
+        }
+    }
+
+    foreach (var th in companions)
+        th.Join(1000);
+}
+
 // ── mode: FMA (original, unchanged) ───────────────────────────────────────
 
 // Dispatches to the widest SIMD FMA path the CPU supports at runtime.
@@ -602,4 +735,4 @@ static void StressLoopVector(int coreIndex, CancellationToken ct)
 
 // ── types ──────────────────────────────────────────────────────────────────
 
-enum StressMode { Fma, Int, Branch, Mixed, Divide, Rotate }
+enum StressMode { Fma, Int, Branch, Call, Threads, Mixed, Divide, Rotate }
