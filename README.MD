@@ -29,6 +29,25 @@ Some processes are excluded on purpose. `explorer.exe` and a few other applicati
 
 This software is best run as a Windows service for two reasons: it's fire-and-forget this way, and it runs as the `Local System` user, which is higher-ish than a regular admin (giving it access to more processes). Higher-ish still doesn’t mean all-powerful, as it still does not grant access to kernel-level software (drivers, antivirus, anticheat, etc.).
 
+# CpuCrashTest
+The repo also ships a companion tool, `CpuCrashTest`, which does the *opposite* of `SetAffinity`: it pins one worker process per logical CPU and stresses each core in isolation, so you can identify which core(s) are faulty before adding them to the mask.
+
+Run with `--mode <name>` (default is `rotate`, which cycles through every mode for 30 s each):
+
+| Mode            | What it stresses                                                                                          |
+|-----------------|-----------------------------------------------------------------------------------------------------------|
+| `pointerchase`  | NaN-box-style ALU chain feeding an immediate load — silent bit-flip becomes `0xC0000005`. **Best bet** for reproducing `hermes.dll` / Unity crashes. |
+| `dispatch`      | Indirect-call hot loop through a 256-entry function-pointer table — same shape as Hermes opcode dispatch and Unity vtable calls. |
+| `bursty`        | ~10 ms full-bore INT+FP burst, then `Sleep(2)` — hammers the Vmin/P-state transition that steady-state stressors miss. |
+| `verify`        | Four shadow LCG chains computed in parallel; logs silent miscalculations *without* crashing. Useful when the faulty core corrupts results without producing an AV. |
+| `int`           | 8× 64-bit LCG + rotate-XOR — IA-core integer multiplier and rotate units.                                |
+| `branch`        | 16-arm `switch` on unpredictable input — front-end, BTB, ROB recovery.                                   |
+| `call`          | Recursion to depth 48 — overflows the Return Stack Buffer.                                               |
+| `mixed`         | INT chains + scalar FP with `CVTSI2SD`/`CVTTSD2SI` — int↔FP bypass network.                              |
+| `divide`        | 8× 64-bit `IDIV` chains — variable-latency microcode division path.                                      |
+| `threads`       | 4 threads pinned to one logical CPU — XSAVE/XRSTOR storms.                                               |
+| `fma`           | Widest SIMD FMA the CPU supports (AVX-512 / AVX2+FMA / `Vector<T>`).                                     |
+
 License
 ----
 MIT

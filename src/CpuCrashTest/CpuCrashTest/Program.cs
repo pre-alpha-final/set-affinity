@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
@@ -23,14 +24,19 @@ else
 
 static StressMode ParseMode(string? s) => s?.ToLowerInvariant() switch
 {
-    "fma"    => StressMode.Fma,
-    "int"    => StressMode.Int,
-    "branch" => StressMode.Branch,
-    "call"    => StressMode.Call,
-    "threads" => StressMode.Threads,
-    "mixed"   => StressMode.Mixed,
-    "divide"  => StressMode.Divide,
-    _         => StressMode.Rotate,
+    "fma"         => StressMode.Fma,
+    "int"         => StressMode.Int,
+    "branch"      => StressMode.Branch,
+    "call"        => StressMode.Call,
+    "threads"     => StressMode.Threads,
+    "mixed"       => StressMode.Mixed,
+    "divide"      => StressMode.Divide,
+    "pointerchase" => StressMode.PointerChase,
+    "ptrchase"    => StressMode.PointerChase,
+    "dispatch"    => StressMode.Dispatch,
+    "bursty"      => StressMode.Bursty,
+    "verify"      => StressMode.Verify,
+    _             => StressMode.Rotate,
 };
 
 static string ModeLabel(StressMode m) => m switch
@@ -38,13 +44,17 @@ static string ModeLabel(StressMode m) => m switch
     StressMode.Fma    => Avx512F.IsSupported          ? "AVX-512 FMA"
                        : (Fma.IsSupported && Avx2.IsSupported) ? "AVX2+FMA"
                        : "SIMD",
-    StressMode.Int    => "INT",
-    StressMode.Branch => "BRANCH",
-    StressMode.Call    => "CALL/RET",
-    StressMode.Threads => "THREADS",
-    StressMode.Mixed   => "MIXED",
-    StressMode.Divide => "DIVIDE",
-    _                 => "ROTATE",
+    StressMode.Int          => "INT",
+    StressMode.Branch       => "BRANCH",
+    StressMode.Call         => "CALL/RET",
+    StressMode.Threads      => "THREADS",
+    StressMode.Mixed        => "MIXED",
+    StressMode.Divide       => "DIVIDE",
+    StressMode.PointerChase => "POINTER-CHASE",
+    StressMode.Dispatch     => "DISPATCH",
+    StressMode.Bursty       => "BURSTY",
+    StressMode.Verify       => "VERIFY",
+    _                       => "ROTATE",
 };
 
 // ── launcher ───────────────────────────────────────────────────────────────
@@ -172,8 +182,14 @@ static void StressDispatcher(int coreIndex, StressMode mode, CancellationToken c
         return;
     }
 
-    // Integer-heavy modes come first — most likely to expose IA-core clock-tree damage.
-    StressMode[] rotation = [StressMode.Int, StressMode.Branch, StressMode.Call, StressMode.Mixed, StressMode.Divide, StressMode.Threads, StressMode.Fma];
+    // Pointer-dereferencing and transition-heavy modes come first — most likely to convert
+    // silent ALU corruption on a faulty core into an observable AV (0xC0000005), matching the
+    // hermes.dll / Unity crash signature.  Integer-heavy modes follow.  FMA last.
+    StressMode[] rotation = [
+        StressMode.PointerChase, StressMode.Dispatch, StressMode.Bursty, StressMode.Verify,
+        StressMode.Int, StressMode.Branch, StressMode.Call, StressMode.Mixed,
+        StressMode.Divide, StressMode.Threads, StressMode.Fma,
+    ];
     int idx = 0;
     while (!ct.IsCancellationRequested)
     {
@@ -190,13 +206,17 @@ static void RunMode(int coreIndex, StressMode mode, CancellationToken ct)
 {
     switch (mode)
     {
-        case StressMode.Int:    StressLoopInt(coreIndex, ct);    break;
-        case StressMode.Branch: StressLoopBranch(coreIndex, ct); break;
-        case StressMode.Call:    StressLoopCall(coreIndex, ct);    break;
-        case StressMode.Threads: StressLoopThreads(coreIndex, ct); break;
-        case StressMode.Mixed:   StressLoopMixed(coreIndex, ct);   break;
-        case StressMode.Divide: StressLoopDivide(coreIndex, ct); break;
-        default:                StressLoopFma(coreIndex, ct);    break;
+        case StressMode.Int:          StressLoopInt(coreIndex, ct);          break;
+        case StressMode.Branch:       StressLoopBranch(coreIndex, ct);       break;
+        case StressMode.Call:         StressLoopCall(coreIndex, ct);         break;
+        case StressMode.Threads:      StressLoopThreads(coreIndex, ct);      break;
+        case StressMode.Mixed:        StressLoopMixed(coreIndex, ct);        break;
+        case StressMode.Divide:       StressLoopDivide(coreIndex, ct);       break;
+        case StressMode.PointerChase: StressLoopPointerChase(coreIndex, ct); break;
+        case StressMode.Dispatch:     StressLoopDispatch(coreIndex, ct);     break;
+        case StressMode.Bursty:       StressLoopBursty(coreIndex, ct);       break;
+        case StressMode.Verify:       StressLoopVerify(coreIndex, ct);       break;
+        default:                      StressLoopFma(coreIndex, ct);          break;
     }
 }
 
@@ -565,6 +585,271 @@ static void StressLoopThreads(int coreIndex, CancellationToken ct)
         th.Join(1000);
 }
 
+// ── mode: POINTER-CHASE ────────────────────────────────────────────────────
+
+// Mimics the hermes.dll NaN-box decode pattern and Unity GC-root walks: an integer ALU
+// chain produces a value that is immediately used as a load address.  Healthy core: the
+// ALU steps cancel each other and the result equals the loaded pointer, so the chase
+// stays in-bounds.  Faulty core: any silent bit-flip in the ALU chain produces a wild
+// pointer and the next dereference faults with AV (0xC0000005) — the same crash signature
+// users see in hermes.dll and UnityPlayer.dll on degraded Raptor Lake cores.
+static unsafe void StressLoopPointerChase(int coreIndex, CancellationToken ct)
+{
+    const int N = 1 << 21;                                  // 2M slots × 8 B = 16 MiB > L2
+    byte* region = (byte*)NativeMemory.AlignedAlloc((nuint)N * 8, 64);
+    try
+    {
+        long* slots = (long*)region;
+
+        // Sattolo shuffle — produces a single cycle of length N through the array,
+        // guaranteeing the chase visits every slot before repeating.
+        var rng = new Random(unchecked(0x0C0FFEE + coreIndex * 7919));
+        int[] perm = new int[N];
+        for (int i = 0; i < N; i++) perm[i] = i;
+        for (int i = N - 1; i > 0; i--)
+        {
+            int j = rng.Next(i);                            // j < i — defining feature of Sattolo
+            (perm[i], perm[j]) = (perm[j], perm[i]);
+        }
+
+        // Each slot stores the absolute address of the next slot in the cycle.
+        for (int i = 0; i < N; i++)
+            slots[i] = (long)(region + (long)perm[i] * 8L);
+
+        // NaN-box tag constants.  TAG_HI mimics the 13-bit NaN exponent + sign bits that
+        // Hermes uses; TAG_LO mimics the 3 low-bit pointer-type tag.  All region pointers
+        // are 8-byte aligned, so their low 3 bits are zero — the AND/OR pair below is a
+        // no-op on healthy silicon and pinpoints any single-bit ALU corruption.
+        const long TAG_HI = unchecked((long)0xFFFE_0000_0000_0000UL);
+        const long TAG_LO = 0x0000_0000_0000_0007L;
+
+        var sw = Stopwatch.StartNew();
+        long iterations = 0;
+        double[] buf = new double[512 * 1024];
+        long p = (long)slots;                               // start at slot[0]
+
+        while (!ct.IsCancellationRequested)
+        {
+            // 8× unrolled: load → tag (XOR + OR) → untag (AND + XOR) → dereference.
+            // On a healthy core, v after the ALU chain equals *(long*)p bit-for-bit, so the
+            // chase follows the Sattolo cycle.  On a faulty core, any glitched ALU output
+            // produces a wild pointer; the next iteration's `*(long*)p` faults.
+            long v;
+            v = *(long*)p; v = ((v ^ TAG_HI) | TAG_LO); v = ((v & ~TAG_LO) ^ TAG_HI); p = v;
+            v = *(long*)p; v = ((v ^ TAG_HI) | TAG_LO); v = ((v & ~TAG_LO) ^ TAG_HI); p = v;
+            v = *(long*)p; v = ((v ^ TAG_HI) | TAG_LO); v = ((v & ~TAG_LO) ^ TAG_HI); p = v;
+            v = *(long*)p; v = ((v ^ TAG_HI) | TAG_LO); v = ((v & ~TAG_LO) ^ TAG_HI); p = v;
+            v = *(long*)p; v = ((v ^ TAG_HI) | TAG_LO); v = ((v & ~TAG_LO) ^ TAG_HI); p = v;
+            v = *(long*)p; v = ((v ^ TAG_HI) | TAG_LO); v = ((v & ~TAG_LO) ^ TAG_HI); p = v;
+            v = *(long*)p; v = ((v ^ TAG_HI) | TAG_LO); v = ((v & ~TAG_LO) ^ TAG_HI); p = v;
+            v = *(long*)p; v = ((v ^ TAG_HI) | TAG_LO); v = ((v & ~TAG_LO) ^ TAG_HI); p = v;
+            iterations++;
+
+            if ((iterations & 0xFF) == 0)
+            {
+                buf[(int)((iterations >> 8) & (buf.Length - 1))] += (double)(p & 0x7FFFFFFFL);
+
+                if (iterations % 5_000_000 == 0)
+                    Console.Write($"\r[Core {coreIndex}] POINTER-CHASE — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {iterations * 8 / 1_000_000}M chases");
+            }
+        }
+    }
+    finally
+    {
+        NativeMemory.AlignedFree(region);
+    }
+}
+
+// ── mode: DISPATCH ─────────────────────────────────────────────────────────
+
+// Threaded-interpreter / vtable analogue.  A table of 256 function pointers is dispatched
+// via `state = table[state & 0xFF](state)` — the indirect-call target depends on the
+// previous handler's return value, so the BTB cannot stably predict it.  Models the
+// hermes.dll opcode-dispatch loop (computed JMP through a 256-entry handler table) and
+// Unity vtable calls.  A corrupted return address or a corrupted dispatch index produces
+// an indirect call to a bogus address and faults with AV (0xC0000005).
+static unsafe void StressLoopDispatch(int coreIndex, CancellationToken ct)
+{
+    const int TableSize = 256;
+    var table = (delegate*<long, long>*)NativeMemory.Alloc((nuint)TableSize * (nuint)sizeof(nint));
+    try
+    {
+        // 8 distinct handlers tile the table.  Different handlers per index slot keep
+        // the BTB from settling on a single hot target.
+        for (int i = 0; i < TableSize; i++)
+        {
+            table[i] = (i & 7) switch
+            {
+                0 => &H_Add,
+                1 => &H_Xor,
+                2 => &H_Rol,
+                3 => &H_Mul,
+                4 => &H_Shl,
+                5 => &H_Sub,
+                6 => &H_Or,
+                _ => &H_Mix,
+            };
+        }
+
+        var sw = Stopwatch.StartNew();
+        long iterations = 0;
+        double[] buf = new double[512 * 1024];
+        long state = unchecked(0x123456789ABCDEF0L + (long)coreIndex * 7919L);
+
+        while (!ct.IsCancellationRequested)
+        {
+            // 8× unrolled.  Each call's target depends on the previous call's result,
+            // forcing a true data-dependent indirect-branch chain — the textbook pattern
+            // that exercises front-end prediction, RSB, and ROB recovery.
+            state = table[(int)(state & 0xFF)](state);
+            state = table[(int)(state & 0xFF)](state);
+            state = table[(int)(state & 0xFF)](state);
+            state = table[(int)(state & 0xFF)](state);
+            state = table[(int)(state & 0xFF)](state);
+            state = table[(int)(state & 0xFF)](state);
+            state = table[(int)(state & 0xFF)](state);
+            state = table[(int)(state & 0xFF)](state);
+            iterations++;
+
+            if ((iterations & 0xFF) == 0)
+            {
+                buf[(int)((iterations >> 8) & (buf.Length - 1))] += (double)(state & 0x7FFFFFFFL);
+
+                if (iterations % 5_000_000 == 0)
+                    Console.Write($"\r[Core {coreIndex}] DISPATCH — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {iterations * 8 / 1_000_000}M dispatches");
+            }
+        }
+    }
+    finally
+    {
+        NativeMemory.Free(table);
+    }
+}
+
+// NoInlining keeps each handler as a real CALL/RET pair the JIT cannot fold into the
+// loop body — without this, RyuJIT would devirtualise the function-pointer table once
+// it proves the targets are statically known.
+[MethodImpl(MethodImplOptions.NoInlining)] static long H_Add(long s) => unchecked(s + (long)0x9E37_79B9_7F4A_7C15UL);
+[MethodImpl(MethodImplOptions.NoInlining)] static long H_Xor(long s) => s ^ unchecked((long)0xDEAD_BEEF_CAFE_BABEUL);
+[MethodImpl(MethodImplOptions.NoInlining)] static long H_Rol(long s) => (long)BitOperations.RotateLeft((ulong)s, 17);
+[MethodImpl(MethodImplOptions.NoInlining)] static long H_Mul(long s) => unchecked(s * 6364136223846793005L);
+[MethodImpl(MethodImplOptions.NoInlining)] static long H_Shl(long s) => unchecked((s << 7) ^ (s >> 3));
+[MethodImpl(MethodImplOptions.NoInlining)] static long H_Sub(long s) => unchecked(s - 0x1234_5678_9ABC_DEF0L);
+[MethodImpl(MethodImplOptions.NoInlining)] static long H_Or (long s) => s | 0x42L;
+[MethodImpl(MethodImplOptions.NoInlining)] static long H_Mix(long s) => unchecked(s ^ (s >> 13) ^ (s << 7));
+
+// ── mode: BURSTY ───────────────────────────────────────────────────────────
+
+// Vmin-transition stressor.  Raptor Lake clock-tree degradation is reportedly most
+// aggressive during rapid voltage/frequency transitions, not steady 100 % load.  This
+// mode alternates ~10 ms of tight INT+FP work (which spins up the core to max P-state)
+// with ~2 ms of Thread.Sleep (which lets the core drop back to a low P-state).  Each
+// transition crosses the Vmin range many times per second.
+static void StressLoopBursty(int coreIndex, CancellationToken ct)
+{
+    var sw = Stopwatch.StartNew();
+    long bursts = 0;
+    double[] buf = new double[512 * 1024];
+
+    ulong x0 = 0x123456789ABCDEF0UL, x1 = 0x23456789ABCDEF01UL;
+    ulong x2 = 0x3456789ABCDEF012UL, x3 = 0x456789ABCDEF0123UL;
+    double f0 = 1.1, f1 = 2.2, f2 = 3.3, f3 = 4.4;
+
+    const ulong A = 6364136223846793005UL;
+    const ulong B = 1442695040888963407UL;
+
+    var burstSw = new Stopwatch();
+    while (!ct.IsCancellationRequested)
+    {
+        burstSw.Restart();
+        // ~10 ms tight INT+FP burst — no progress checks, no branching surprises;
+        // pure issue-port pressure so the core ramps to its peak P-state quickly.
+        while (burstSw.ElapsedMilliseconds < 10)
+        {
+            for (int i = 0; i < 4096; i++)
+            {
+                x0 = unchecked(x0 * A + B); x1 = unchecked(x1 * A + B);
+                x2 = unchecked(x2 * A + B); x3 = unchecked(x3 * A + B);
+                f0 = f0 * 1.0000001 + 0.0000001; f1 = f1 * 1.0000001 + 0.0000001;
+                f2 = f2 * 1.0000001 + 0.0000001; f3 = f3 * 1.0000001 + 0.0000001;
+            }
+        }
+
+        // Reset FP chains before they overflow.
+        if (f0 > 1e15) { f0 = 1.1; f1 = 2.2; f2 = 3.3; f3 = 4.4; }
+
+        // ~2 ms park — long enough for the kernel to drop the core's frequency request
+        // and for the package C-state controller to step the voltage down.
+        Thread.Sleep(2);
+        bursts++;
+
+        if ((bursts & 0xFF) == 0)
+        {
+            buf[(int)((bursts >> 8) & (buf.Length - 1))] += f0 + (double)(x0 & 0x7FFFFFFFUL);
+
+            if (bursts % 1000 == 0)
+                Console.Write($"\r[Core {coreIndex}] BURSTY — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {bursts} bursts");
+        }
+    }
+}
+
+// ── mode: VERIFY ───────────────────────────────────────────────────────────
+
+// Silent-error detector.  Runs four LCG+mix shadow chains from the same seed with the
+// same operations.  On a healthy core, all four chains stay bit-identical forever.  On
+// a faulty core, a single transient port glitch desynchronises one chain from the other
+// three — and from that point on, the divergence persists, so any glitch detected once
+// is loudly visible on every subsequent block.  Does NOT crash; logs mismatches.  This
+// is the only mode that catches Raptor Lake degradation when it manifests as silent
+// miscalculation instead of an immediate AV.
+static void StressLoopVerify(int coreIndex, CancellationToken ct)
+{
+    var sw = Stopwatch.StartNew();
+    long blocks = 0;
+    long mismatches = 0;
+    double[] buf = new double[512 * 1024];
+
+    const ulong K    = 6364136223846793005UL;
+    const ulong C    = 1442695040888963407UL;
+    const ulong SEED = 0x123456789ABCDEF0UL;
+
+    while (!ct.IsCancellationRequested)
+    {
+        // Re-seed every block so a one-time desync doesn't silently mask later glitches.
+        ulong a = SEED, b = SEED, c = SEED, d = SEED;
+
+        // 1024 identical LCG+rotate-XOR steps on four independent register sets.
+        // The JIT keeps the four chains on distinct physical registers and dispatches
+        // their IMUL/ROL/XOR uops in parallel across the integer ports, so a port-local
+        // glitch typically affects only one chain.
+        for (int i = 0; i < 1024; i++)
+        {
+            a = unchecked(a * K + C); a = BitOperations.RotateLeft(a, 17) ^ (a >> 31);
+            b = unchecked(b * K + C); b = BitOperations.RotateLeft(b, 17) ^ (b >> 31);
+            c = unchecked(c * K + C); c = BitOperations.RotateLeft(c, 17) ^ (c >> 31);
+            d = unchecked(d * K + C); d = BitOperations.RotateLeft(d, 17) ^ (d >> 31);
+        }
+        blocks++;
+
+        if (a != b || a != c || a != d)
+        {
+            mismatches++;
+            Console.WriteLine();
+            Console.WriteLine($"[Core {coreIndex}] *** SILENT MISMATCH #{mismatches} @ block {blocks} ***");
+            Console.WriteLine($"    a=0x{a:X16}  b=0x{b:X16}");
+            Console.WriteLine($"    c=0x{c:X16}  d=0x{d:X16}");
+        }
+
+        if ((blocks & 0x3F) == 0)
+        {
+            buf[(int)((blocks >> 6) & (buf.Length - 1))] += (double)(a & 0x7FFFFFFFUL);
+
+            if (blocks % 1000 == 0)
+                Console.Write($"\r[Core {coreIndex}] VERIFY — {sw.Elapsed:hh\\:mm\\:ss} elapsed, {blocks} blocks, {mismatches} mismatches");
+        }
+    }
+}
+
 // ── mode: FMA (original, unchanged) ───────────────────────────────────────
 
 // Dispatches to the widest SIMD FMA path the CPU supports at runtime.
@@ -735,4 +1020,4 @@ static void StressLoopVector(int coreIndex, CancellationToken ct)
 
 // ── types ──────────────────────────────────────────────────────────────────
 
-enum StressMode { Fma, Int, Branch, Call, Threads, Mixed, Divide, Rotate }
+enum StressMode { Fma, Int, Branch, Call, Threads, Mixed, Divide, PointerChase, Dispatch, Bursty, Verify, Rotate }
