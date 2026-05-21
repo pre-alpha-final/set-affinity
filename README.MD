@@ -30,57 +30,41 @@ Some processes are excluded on purpose. `explorer.exe` and a few other applicati
 This software is best run as a Windows service for two reasons: it's fire-and-forget this way, and it runs as the `Local System` user, which is higher-ish than a regular admin (giving it access to more processes). Higher-ish still doesn’t mean all-powerful, as it still does not grant access to kernel-level software (drivers, antivirus, anticheat, etc.).
 
 # CpuCrashTest
-The repo also ships a companion tool, `CpuCrashTest`, which does the *opposite* of `SetAffinity`: it pins one worker process per logical CPU and stresses each core in isolation, so you can identify which core(s) are faulty before adding them to the mask.
+The repo also ships a companion tool, `CpuCrashTest`, which identifies faulty CPU cores by using the Xbox PC app — a real app known to crash within seconds on degraded Raptor Lake silicon — as the test workload.
 
-Run with `--mode <name>` (default is `rotate`, which alternates `deepidle` and `idxcall` every 30 s):
-
-| Mode            | What it stresses                                                                                          |
-|-----------------|-----------------------------------------------------------------------------------------------------------|
-| `external`      | Spawns a *real* user-supplied binary (e.g. `node.exe` running a JS workload, or your actual problem app) pinned to each candidate core, watches whether it crashes with `0xC0000005` (or other silicon-fault status codes) within `--timeout` seconds.  Bypasses the impossible task of guessing what microarchitectural state synthetic loops are missing — uses the actual failure symptom directly.  **Recommended as the primary diagnostic.**  See "External-app mode" below. |
-| `deepidle`      | Long `Thread.Sleep(100 ms)` (allows the logical CPU to drop to C6 — Windows' default DemotePromote heuristic demotes after ~70 ms idle), then a 2 ms `idxcall`-style burst on wake-up.  Targets the Raptor Lake **Vmin-shift transition** directly: degraded RPL silicon often doesn't fail under sustained load — it fails in the first ~µs after wake-up, when the voltage applied is too low for the degraded transistors.  Real apps (XboxPcApp, browsers, anything UI-driven) do exactly this every frame at 60 FPS, while sustained stress loops never exercise the transition. |
-| `idxcall`       | Scale-4 indexed load inside a depth-128 NoInlining recursive function — one load on the way down, one on the way back up.  Models the exact shape of real `hermes.dll` crashes: the bytecode interpreter recurses ~200 frames deep (genuine C++ CALL/RET pairs, not threaded dispatch) and the AV is a `mov r32, [base + idx*4 + disp]` deep inside that chain.  RSB exhausts around depth 16-24, so every RET on the way up is a mispredict recovered via the indirect predictor while the load/store unit does the indexed chases. |
-| `rotate`        | Default.  Alternates `deepidle` and `idxcall` every 30 s. |
-
-> Earlier modes (`fma`, `int`, `branch`, `call`, `mixed`, `divide`, `threads`, `pointerchase`, `dispatch`, `bursty`, `verify`, `hermes`, `atomic`, `memcpy`, `bmi`, `idxchase`) were removed.  None of them reproduced any AV in overnight runs on cores independently confirmed as faulty via `external` mode — the failure mode does not appear to be raw-stress-driven.
-
-## Recommended order for Hermes / Unity AV reproduction
-
-If your faulty CPU produces Access Violations (`0xC0000005`) in `hermes.dll` (React Native), `UnityPlayer.dll`, or specific apps like XboxPcApp.exe:
-
-1. **`external`** — the most reliable diagnostic in practice.  If you already know an app that crashes on the faulty core, use that as the test; otherwise a tight Node.js property-access loop is the closest proxy to the hermes.dll workload.  See below.
-2. **`deepidle`** — best synthetic candidate.  Most likely to reproduce if the failure is the classic Raptor Lake Vmin-shift on wake-up from C-state idle (the canonical RPL failure mode).
-3. **`idxcall`** — replicates the literal faulting instruction *and* the deep recursive CALL/RET chain observed in real Hermes crashes.  Useful as a control comparison vs `deepidle`: if `deepidle` reproduces but `idxcall` doesn't, that pins the trigger to the C-state transition rather than the instruction itself.
-
-## External-app mode
-
-If synthetic stress modes fail to reproduce, `--mode external` lets a real binary be the test.  This is often the only reliable way to identify a faulty core that exhibits "crashes only in specific apps" behaviour — typical of late-stage Raptor Lake Vmin degradation.
+It sweeps every logical CPU in order: launches the Xbox app, pins it to one core, waits 20 seconds watching for a crash, kills it, and moves to the next core.  After the last core it loops back to 0 and repeats until Ctrl+C.
 
 ```
-CpuCrashTest.exe --mode external --exec <path-to-binary> --args "<args-to-binary>" [--cores N[,N...]] [--timeout SECONDS]
+CpuCrashTest.exe
 ```
 
-For each core under test, spawns the binary, immediately pins it to that single logical CPU via `SetProcessAffinityMask`, and waits up to `--timeout` seconds (default 30) for it to exit.  Any exit with a Windows status code with the high bit set (`0xC0000000`+) is reported as a crash — `0xC0000005` Access Violation, `0xC000001D` Illegal Instruction, and a handful of other silicon-failure signatures are recognised by name.  All cores are tested in parallel (each pinned process can't contend with the others).
-
-Examples:
+No arguments needed.  Sample output:
 
 ```
-:: Test cores 4 and 6 by running a tight Node.js property-access loop for 30 s each.
-:: This is the workload pattern closest to the hermes.dll crash signature.
-CpuCrashTest.exe --mode external --exec node.exe ^
-  --args "-e \"while(true){var x={};for(var i=0;i<1000;i++)x['p'+i]=i;}\"" ^
-  --cores 4,6 --timeout 30
-
-:: Sweep every core with a longer-lived run of your actual problem app.
-CpuCrashTest.exe --mode external --exec "C:\Path\To\XboxPcApp.exe" --timeout 60
+── Pass 1 ────────────────────────────────────────
+  CPU  0  │ PID 9182  │ pinned → CPU 0  │ healthy (survived 20s) → killed
+  CPU  1  │ PID 9240  │ pinned → CPU 1  │ healthy (survived 20s) → killed
+  ...
+  CPU  6  │ PID 9318  │ pinned → CPU 6  │ *** CRASH 0xC0000005 [ACCESS_VIOLATION]  →  CPU 6 IS SUSPECT ***
+  CPU  7  │ PID 9401  │ pinned → CPU 7  │ healthy (survived 20s) → killed
+  ...
 ```
 
-The cleanest workload is one that hammers the suspect instruction pattern and runs longer than the timeout (so the only way the process exits is by crashing or being killed).  A "clean exit (code 0)" result means the workload finished before the timeout and gives no evidence either way — use longer-running args.
+Once you know the faulty logical CPU number(s), add their bits to the `SetAffinity` service mask to exclude them from normal process scheduling.
 
-## Diagnostic tips
+### How it works
 
-- The worker prints `Affinity OK: running on logical CPU N as requested` on startup.  If you instead see `*** AFFINITY MISMATCH ***`, Task Manager's `CPU N` numbering does not match what the kernel sees (typical causes: processor groups on >64-LP systems, affinity-blocking security software).  Test results won't be meaningful until that's resolved.
-- Get an actual crash dump and look at the faulting instruction (Event Viewer → Windows Logs → Application → `.NET Runtime` / `Application Error` event, then load the `.dmp` in WinDbg).  The exact opcode bytes and the SIB scale tell you which instruction pattern to target — that's how `idxchase` was designed.
-- Run `--mode verify` for an hour.  If it never logs a silent mismatch, the worker may not actually be pinned to the faulty core (P-core / E-core / HT-sibling numbering can differ from Task Manager's `CPU0..CPUn`).
+The Xbox PC app is a Microsoft Store package and cannot be launched with a plain `Process.Start`.  The tool activates it through the Windows shell:
+
+```
+explorer.exe shell:appsFolder\Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App
+```
+
+Explorer performs the package activation and exits immediately; `XboxPcApp.exe` appears a moment later.  The tool polls for the process (up to 5 s), sets `ProcessorAffinity` to a single-bit mask for the target core, then calls `WaitForExitAsync` with a 20-second timeout.
+
+- **Crash** — the process exits with an NT error status (high bit set, e.g. `0xC0000005`): the core is flagged as suspect.
+- **Survived** — the 7-second timeout fires while the process is still alive: the core is healthy for this workload, the app is killed, and the next core is tested.
+- **Affinity failed** — `SetProcessAffinityMask` was rejected (rare; can happen if a security product intercepts it): the core is skipped with a warning.
 
 License
 ----
