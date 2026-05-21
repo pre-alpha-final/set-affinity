@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 
 // Launches the Xbox PC app, immediately pins it to one logical CPU, waits up to
 // TestMs for it to crash (exit with an NT error status), then kills it and moves to
@@ -12,39 +12,72 @@
 
 const string ShellTarget = @"shell:appsFolder\Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App";
 const string ProcessName = "XboxPcApp";   // Process.ProcessName — no .exe suffix
-const int    TestMs      = 10_000;         // time pinned to each core before declaring healthy
+const int    TestMs      = 15_000;         // time pinned to each core before declaring healthy
 const int    LaunchMs    = 5_000;          // max time to wait for XboxPcApp.exe to appear after activation
 const int    GapMs       = 1_500;          // cooldown between kill and next launch
 
 int coreCount = int.TryParse(Environment.GetEnvironmentVariable("NUMBER_OF_PROCESSORS"), out int n)
     ? n : Environment.ProcessorCount;
+int pairCount = coreCount / 2;   // each pair = one physical core (two SMT threads)
+
+// Log file sits next to the executable, named with the start timestamp so repeated
+// runs don't overwrite each other.
+string logPath = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.Desktop),
+    $"crash-log-{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.txt");
+using var log = new StreamWriter(logPath, append: false, System.Text.Encoding.UTF8) { AutoFlush = true };
+
+void Log(string line)
+{
+    string stamped = $"[{DateTime.Now:HH:mm:ss}] {line}";
+    Console.WriteLine(stamped);
+    log.WriteLine(stamped);
+}
+
+void LogWrite(string text)
+{
+    // Write to console without newline; log gets a placeholder that will be
+    // completed by the next Log() call which provides the full line.
+    Console.Write(text);
+    log.Write(text);
+}
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
-Console.WriteLine("╔═══════════════════════════════════════╗");
-Console.WriteLine("║   XBOX APP  ·  CORE CRASH IDENTIFIER  ║");
-Console.WriteLine("╚═══════════════════════════════════════╝");
-Console.WriteLine($"  Logical CPUs : 0 – {coreCount - 1}");
-Console.WriteLine($"  Process      : {ProcessName}.exe");
-Console.WriteLine($"  Per core     : {TestMs / 1000}s pinned, then killed → next core");
+string header =
+    $"╔═══════════════════════════════════════╗\n" +
+    $"║   XBOX APP  ·  CORE CRASH IDENTIFIER  ║\n" +
+    $"╚═══════════════════════════════════════╝\n" +
+    $"  Logical CPUs : {coreCount}  ({pairCount} physical core pair{(pairCount == 1 ? "" : "s")})\n" +
+    $"  Process      : {ProcessName}.exe\n" +
+    $"  Per pair     : {TestMs / 1000}s pinned, then killed → next pair\n" +
+    $"  Log file     : {logPath}\n";
+Console.Write(header);
+log.Write(header);
+
 Console.WriteLine();
-Console.WriteLine("Ctrl+C to stop.");
-Console.WriteLine("Cores that print  *** CRASH ***  are suspect.");
+log.WriteLine();
+Log("Ctrl+C to stop.  Cores that print *** CRASH *** are suspect.");
 Console.WriteLine();
+log.WriteLine();
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
 int pass = 0;
-int core = 0;
+int pair = 0;
 
 try
 {
     while (!cts.IsCancellationRequested)
     {
-        if (core == 0)
-            Console.WriteLine($"── Pass {++pass} {new string('─', Math.Max(0, 44 - pass.ToString().Length))}");
+        if (pair == 0)
+            Log($"── Pass {++pass} {new string('─', Math.Max(0, 44 - pass.ToString().Length))}");
 
-        Console.Write($"  CPU {core,2}  │ ");
+        int cpuLo   = pair * 2;
+        int cpuHi   = cpuLo + 1;
+        nint mask   = (nint)(3L << cpuLo);   // both SMT threads of the physical core
+
+        LogWrite($"  CPUs {cpuLo}+{cpuHi}  │ ");
 
         // Kill any previous instance and let it fully vanish before the next launch.
         KillByName(ProcessName);
@@ -58,52 +91,63 @@ try
         using Process? proc = await PollAsync(ProcessName, LaunchMs, cts.Token);
         if (proc is null)
         {
-            Console.WriteLine("process did not appear — skipped");
-            core = (core + 1) % coreCount;
+            string skipped = "process did not appear — skipped";
+            Console.WriteLine(skipped);
+            log.WriteLine(skipped);
+            pair = (pair + 1) % pairCount;
             continue;
         }
 
-        // Pin the process to this single logical CPU.
-        if (!TryPin(proc, core, out string pinErr))
+        // Pin the process to both logical CPUs of this physical core.
+        if (!TryPin(proc, mask, out string pinErr))
         {
-            Console.WriteLine($"affinity failed ({pinErr}) — skipped");
+            string pinFail = $"affinity failed ({pinErr}) — skipped";
+            Console.WriteLine(pinFail);
+            log.WriteLine(pinFail);
             KillByName(ProcessName);
             await SleepAsync(GapMs, cts.Token);
-            core = (core + 1) % coreCount;
+            pair = (pair + 1) % pairCount;
             continue;
         }
 
-        Console.Write($"PID {proc.Id}  │ pinned → CPU {core}  │ ");
+        string pinned = $"PID {proc.Id}  │ pinned → CPUs {cpuLo}+{cpuHi}  │ ";
+        Console.Write(pinned);
+        log.Write(pinned);
 
         (bool crashed, string status) = await WatchAsync(proc, TestMs, cts.Token);
 
         if (crashed)
         {
+            string crashLine = $"*** CRASH {status}  →  CPUs {cpuLo}+{cpuHi} (physical core {pair}) IS SUSPECT ***";
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"*** CRASH {status}  →  CPU {core} IS SUSPECT ***");
+            Console.WriteLine(crashLine);
             Console.ResetColor();
+            log.WriteLine(crashLine);
         }
         else if (status == "cancelled")
         {
             Console.WriteLine("cancelled");
+            log.WriteLine("cancelled");
             break;
         }
         else
         {
-            Console.WriteLine($"healthy ({status}) → killed");
+            string ok = $"healthy ({status}) → killed";
+            Console.WriteLine(ok);
+            log.WriteLine(ok);
             KillByName(ProcessName);
         }
 
         await SleepAsync(GapMs, cts.Token);
-        core = (core + 1) % coreCount;
+        pair = (pair + 1) % pairCount;
     }
 }
 catch (OperationCanceledException) { }
 finally
 {
     KillByName(ProcessName);
-    Console.WriteLine();
-    Console.WriteLine("Stopped.");
+    Log("Stopped.");
+    Log($"Full log saved to: {logPath}");
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -145,11 +189,11 @@ static async Task<Process?> PollAsync(string name, int maxMs, CancellationToken 
     return null;
 }
 
-static bool TryPin(Process proc, int core, out string err)
+static bool TryPin(Process proc, nint mask, out string err)
 {
     try
     {
-        proc.ProcessorAffinity = (nint)(1L << core);
+        proc.ProcessorAffinity = mask;
         err = "";
         return true;
     }
