@@ -66,6 +66,17 @@ Explorer performs the package activation and exits immediately; `XboxPcApp.exe` 
 - **Survived** — the 7-second timeout fires while the process is still alive: the core is healthy for this workload, the app is killed, and the next core is tested.
 - **Affinity failed** — `SetProcessAffinityMask` was rejected (rare; can happen if a security product intercepts it): the core is skipped with a warning.
 
+# KeepEmBusy
+After `CpuCrashTest` finds faulty logical CPUs and `SetAffinity` excludes them from normal scheduling, run `KeepEmBusy` to pin a 100% CPU burn worker on each bad core. That keeps the scheduler from placing other work on those cores.
+
+```
+KeepEmBusy.exe 8 9 10 11
+```
+
+The parent process supervises one hidden child per core (`KeepEmBusy.exe child <n>`). If a child exits (crash or kill), the parent restarts it after a short backoff. Press Ctrl+C to stop the parent and all children.
+
+`SetAffinity` blacklists command lines containing `KeepEmBusy.exe child` so burn workers keep their single-core pin; the parent (`KeepEmBusy.exe 8 9 …`) is not blacklisted and may receive the good-core mask like any other app.
+
 License
 ----
 MIT

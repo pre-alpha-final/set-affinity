@@ -15,7 +15,8 @@ internal class App : BackgroundService
         "svchost.exe -k DcomLaunch -p",
         "winlogon.exe",
         "steam.exe",
-        "CpuCrashTest.exe\" --worker",
+        "KeepEmBusy.exe child",
+        "KeepEmBusy.exe\" child",
     ];
     private readonly HashSet<string> _appLaunchersBlacklistIdentifiers = new();
     private readonly List<string> _extendedDelay =
