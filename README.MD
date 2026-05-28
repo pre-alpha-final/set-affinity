@@ -67,7 +67,7 @@ Explorer performs the package activation and exits immediately; `XboxPcApp.exe` 
 - **Affinity failed** — `SetProcessAffinityMask` was rejected (rare; can happen if a security product intercepts it): the core is skipped with a warning.
 
 # KeepEmBusy
-After `CpuCrashTest` finds faulty logical CPUs and `SetAffinity` excludes them from normal scheduling, run `KeepEmBusy` to pin a 100% CPU burn worker on each bad core. That keeps the scheduler from placing other work on those cores.
+After `CpuCrashTest` finds faulty logical CPUs and `SetAffinity` excludes them from normal scheduling, run `KeepEmBusy` to pin a low-duty worker on each bad core (~2% average CPU per core). Each child wakes on its core periodically so the scheduler tends to leave that logical CPU alone, without a sustained 100% load that would drive turbo boost.
 
 ```
 KeepEmBusy.exe 8 9 10 11

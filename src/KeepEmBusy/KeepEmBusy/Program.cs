@@ -2,9 +2,11 @@
 
 // Parent: KeepEmBusy.exe 8 9 10 11
 //   Spawns one hidden child per core; restarts on exit until Ctrl+C.
-// Child: KeepEmBusy.exe child 8  (internal — pins to CPU 8 and burns 100%)
+// Child: KeepEmBusy.exe child 8  (internal — pins to CPU 8, low duty-cycle load)
 
 const int RestartBackoffMs = 400;
+const int DutyPeriodMs = 200;   // wake on this core every period
+const int DutyBusyMs = 4;       // ~2% average CPU — enough to hold the core without boosting clocks
 
 if (args.Length >= 1 && args[0].Equals("child", StringComparison.OrdinalIgnoreCase))
 {
@@ -28,9 +30,11 @@ static void RunChild(string[] args)
         return;
     }
 
+    var self = Process.GetCurrentProcess();
     try
     {
-        Process.GetCurrentProcess().ProcessorAffinity = (nint)(1L << core);
+        self.ProcessorAffinity = (nint)(1L << core);
+        self.PriorityClass = ProcessPriorityClass.Idle;
     }
     catch (Exception ex)
     {
@@ -38,9 +42,16 @@ static void RunChild(string[] args)
         Environment.Exit(1);
     }
 
-    long n = 0;
+    int sleepMs = Math.Max(1, DutyPeriodMs - DutyBusyMs);
     while (true)
-        n = Interlocked.Increment(ref n);
+    {
+        long deadline = Environment.TickCount64 + DutyBusyMs;
+        long n = 0;
+        while (Environment.TickCount64 < deadline)
+            n = Interlocked.Increment(ref n);
+
+        Thread.Sleep(sleepMs);
+    }
 }
 
 // ─── parent ──────────────────────────────────────────────────────────────────
@@ -59,7 +70,7 @@ static async Task RunParentAsync(string[] args)
     Console.WriteLine("║      KEEP EM BUSY  ·  FAULTY CORES    ║");
     Console.WriteLine("╚═══════════════════════════════════════╝");
     Console.WriteLine($"  Logical CPUs : {string.Join(", ", cores.Select(c => $"CPU {c}"))}");
-    Console.WriteLine($"  Children     : hidden, restarted on exit");
+    Console.WriteLine($"  Children     : hidden, ~{DutyBusyMs * 100 / DutyPeriodMs}% duty per core, restarted on exit");
     Console.WriteLine();
     Console.WriteLine("Ctrl+C to stop.");
     Console.WriteLine();
